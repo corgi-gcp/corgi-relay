@@ -1,16 +1,12 @@
 /**
- * Tunnel Client — runs on Mac mini, connects outward to Railway relay,
- * forwards traffic to the local Eragon gateway.
+ * Tunnel Client v2 — maintains a SEPARATE gateway WS per browser session.
  *
- * Env:
- *   RELAY_URL       — wss://relay-xxx.up.railway.app/tunnel?token=SECRET
- *   GATEWAY_URL     — ws://127.0.0.3:19789 (local Eragon gateway)
- *   TUNNEL_SECRET   — shared secret matching the relay
+ * Relay sends envelopes: { sid, data } or { type: "browser_open/close", sid }
+ * For each browser sid, we open a dedicated gateway connection.
+ * Gateway responses are wrapped back: { sid, data } → relay → browser
  */
 
 'use strict';
-
-const WebSocket = require('ws');
 
 const RELAY_URL = process.env.RELAY_URL || '';
 const GATEWAY_URL = process.env.GATEWAY_URL || 'ws://127.0.0.3:19789';
@@ -26,90 +22,122 @@ const fullRelayUrl = RELAY_URL.includes('?')
   : `${RELAY_URL}/tunnel?token=${TUNNEL_SECRET}`;
 
 let relayWs = null;
-let gatewayWs = null;
-let reconnectTimer = null;
+const gateways = new Map(); // sid → { ws, ready, queue }
 
-function connectGateway() {
-  if (gatewayWs && gatewayWs.readyState === WebSocket.OPEN) return gatewayWs;
+function openGateway(sid) {
+  if (gateways.has(sid)) return;
 
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(GATEWAY_URL);
-    ws.on('open', () => {
-      console.log(`[tunnel] Connected to local gateway: ${GATEWAY_URL}`);
-      gatewayWs = ws;
-      resolve(ws);
-    });
-    ws.on('error', (err) => {
-      console.error('[tunnel] Gateway error:', err.message);
-      reject(err);
-    });
-    ws.on('close', () => {
-      console.log('[tunnel] Gateway connection closed');
-      gatewayWs = null;
-    });
+  const entry = { ws: null, ready: false, queue: [] };
+  gateways.set(sid, entry);
+
+  console.log(`[tunnel] Opening gateway for browser ${sid.slice(0,8)}`);
+  const ws = new WebSocket(GATEWAY_URL);
+  entry.ws = ws;
+
+  ws.addEventListener('open', () => {
+    console.log(`[tunnel] Gateway open for ${sid.slice(0,8)}`);
+    entry.ready = true;
+    // Flush queued messages
+    for (const msg of entry.queue) {
+      ws.send(msg);
+    }
+    entry.queue = [];
   });
+
+  ws.addEventListener('message', (event) => {
+    const data = typeof event.data === 'string' ? event.data : event.data.toString();
+    // Send back to relay with sid envelope
+    if (relayWs && relayWs.readyState === WebSocket.OPEN) {
+      relayWs.send(JSON.stringify({ sid, data }));
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    console.log(`[tunnel] Gateway closed for ${sid.slice(0,8)}`);
+    gateways.delete(sid);
+  });
+
+  ws.addEventListener('error', (e) => {
+    console.error(`[tunnel] Gateway error for ${sid.slice(0,8)}:`, e.message || 'failed');
+  });
+}
+
+function closeGateway(sid) {
+  const entry = gateways.get(sid);
+  if (entry) {
+    entry.ws?.close();
+    gateways.delete(sid);
+    console.log(`[tunnel] Closed gateway for ${sid.slice(0,8)}`);
+  }
+}
+
+function forwardToGateway(sid, data) {
+  let entry = gateways.get(sid);
+  if (!entry) {
+    openGateway(sid);
+    entry = gateways.get(sid);
+  }
+  if (entry.ready) {
+    entry.ws.send(data);
+  } else {
+    entry.queue.push(data);
+  }
 }
 
 function connectRelay() {
   if (relayWs && relayWs.readyState === WebSocket.OPEN) return;
 
-  console.log(`[tunnel] Connecting to relay: ${fullRelayUrl.replace(/token=.*/, 'token=***')}`);
+  console.log('[tunnel] Connecting to relay...');
   relayWs = new WebSocket(fullRelayUrl);
 
-  relayWs.on('open', () => {
-    console.log('[tunnel] Connected to relay');
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  relayWs.addEventListener('open', () => {
+    console.log('[tunnel] ✓ Connected to relay');
   });
 
-  relayWs.on('message', async (data) => {
-    // Message from browser via relay → forward to local gateway
+  relayWs.addEventListener('message', (event) => {
+    const raw = typeof event.data === 'string' ? event.data : event.data.toString();
     try {
-      if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN) {
-        await connectGateway();
-      }
+      const envelope = JSON.parse(raw);
 
-      // Forward to gateway
-      gatewayWs.send(data.toString());
-
-      // Set up response forwarding (one-time per gateway connection)
-      if (!gatewayWs._relayForwardSetup) {
-        gatewayWs._relayForwardSetup = true;
-        gatewayWs.on('message', (gwData) => {
-          if (relayWs && relayWs.readyState === WebSocket.OPEN) {
-            relayWs.send(gwData.toString());
-          }
-        });
+      if (envelope.type === 'browser_open') {
+        openGateway(envelope.sid);
+        return;
       }
-    } catch (err) {
-      console.error('[tunnel] Failed to forward to gateway:', err.message);
-      if (relayWs && relayWs.readyState === WebSocket.OPEN) {
-        relayWs.send(JSON.stringify({ error: 'Gateway connection failed: ' + err.message }));
+      if (envelope.type === 'browser_close') {
+        closeGateway(envelope.sid);
+        return;
       }
+      if (envelope.sid && envelope.data) {
+        forwardToGateway(envelope.sid, envelope.data);
+        return;
+      }
+    } catch (e) {
+      console.error('[tunnel] Parse error:', e.message);
     }
   });
 
-  relayWs.on('close', (code, reason) => {
-    console.log(`[tunnel] Relay disconnected (${code}). Reconnecting in 3s...`);
+  relayWs.addEventListener('close', (event) => {
+    console.log(`[tunnel] Relay disconnected (${event.code}). Reconnecting in 3s...`);
     relayWs = null;
-    reconnectTimer = setTimeout(connectRelay, 3000);
+    // Close all gateway connections
+    for (const [sid, entry] of gateways) {
+      entry.ws?.close();
+    }
+    gateways.clear();
+    setTimeout(connectRelay, 3000);
   });
 
-  relayWs.on('error', (err) => {
-    console.error('[tunnel] Relay error:', err.message);
-  });
-
-  relayWs.on('ping', () => {
-    relayWs.pong();
+  relayWs.addEventListener('error', (e) => {
+    console.error('[tunnel] Relay error:', e.message || 'failed');
   });
 }
 
-// Start
 connectRelay();
+setInterval(() => {}, 30000);
 
-// Keep alive
 process.on('SIGTERM', () => {
   console.log('[tunnel] Shutting down...');
-  if (relayWs) relayWs.close();
-  if (gatewayWs) gatewayWs.close();
+  relayWs?.close();
+  for (const [, entry] of gateways) entry.ws?.close();
   process.exit(0);
 });

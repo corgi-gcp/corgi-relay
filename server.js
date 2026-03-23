@@ -1,14 +1,14 @@
 /**
- * Corgi WS Relay — bridges browser ↔ Mac mini gateway
+ * Corgi WS Relay v2 — per-browser-session multiplexing
  *
- * Architecture:
- *   Mac mini (tunnel client) → connects to /tunnel?token=SECRET
- *   Browser (dashboard)      → connects to /ws?token=GATEWAY_TOKEN
- *   Relay forwards messages bidirectionally between them.
+ * Each browser gets a unique sessionId. The relay wraps all messages
+ * with the sessionId so the tunnel client can maintain separate
+ * gateway connections per browser.
  *
- * Env:
- *   PORT           — HTTP port (Railway sets this)
- *   TUNNEL_SECRET  — shared secret the Mac mini tunnel client uses
+ * Browser → relay: raw gateway messages
+ * Relay → tunnel: { sid: "xxx", data: "..." }
+ * Tunnel → relay: { sid: "xxx", data: "..." }
+ * Relay → browser: raw gateway messages (routed by sid)
  */
 
 'use strict';
@@ -16,18 +16,13 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const url = require('url');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3001;
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'corgi-tunnel-2026';
 
-// ── State ──────────────────────────────────────────────────────────────────────
-
-let tunnelSocket = null;          // The single Mac mini tunnel connection
-const browserSockets = new Set(); // All connected browser clients
-let pendingRequests = new Map();  // reqId → browser socket (for request/response pairing)
-let reqCounter = 0;
-
-// ── HTTP server ────────────────────────────────────────────────────────────────
+let tunnelSocket = null;
+const browsers = new Map(); // sid → ws
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
@@ -35,15 +30,13 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       healthy: true,
       tunnel: tunnelSocket?.readyState === WebSocket.OPEN ? 'connected' : 'disconnected',
-      browsers: browserSockets.size,
+      browsers: browsers.size,
     }));
     return;
   }
   res.writeHead(200);
-  res.end('Corgi Relay');
+  res.end('Corgi Relay v2');
 });
-
-// ── WebSocket server ───────────────────────────────────────────────────────────
 
 const wss = new WebSocketServer({ server });
 
@@ -52,30 +45,28 @@ wss.on('connection', (ws, req) => {
   const path = parsed.pathname;
   const token = parsed.query.token || '';
 
-  // ── Tunnel connection (Mac mini) ───────────────────────────────────────────
+  // ── Tunnel (Mac mini) ──
   if (path === '/tunnel') {
     if (token !== TUNNEL_SECRET) {
-      console.log('[relay] Tunnel auth failed');
       ws.close(4001, 'Unauthorized');
       return;
     }
-
-    // Replace old tunnel if exists
     if (tunnelSocket && tunnelSocket.readyState === WebSocket.OPEN) {
-      console.log('[relay] Replacing old tunnel connection');
       tunnelSocket.close(1000, 'replaced');
     }
-
     tunnelSocket = ws;
-    console.log('[relay] Tunnel connected from Mac mini');
+    console.log('[relay] Tunnel connected');
 
-    ws.on('message', (data) => {
-      // Forward gateway response to ALL connected browsers
-      const msg = data.toString();
-      for (const browser of browserSockets) {
-        if (browser.readyState === WebSocket.OPEN) {
-          browser.send(msg);
+    ws.on('message', (raw) => {
+      try {
+        const envelope = JSON.parse(raw.toString());
+        const { sid, data } = envelope;
+        const browser = browsers.get(sid);
+        if (browser && browser.readyState === WebSocket.OPEN) {
+          browser.send(data);
         }
+      } catch (e) {
+        console.error('[relay] Bad tunnel message:', e.message);
       }
     });
 
@@ -84,57 +75,48 @@ wss.on('connection', (ws, req) => {
       if (tunnelSocket === ws) tunnelSocket = null;
     });
 
-    ws.on('error', (err) => {
-      console.error('[relay] Tunnel error:', err.message);
-    });
-
-    // Send a ping every 25s to keep the connection alive
-    const pingInterval = setInterval(() => {
+    const ping = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) ws.ping();
-      else clearInterval(pingInterval);
+      else clearInterval(ping);
     }, 25000);
-
     return;
   }
 
-  // ── Browser connection (dashboard frontend) ────────────────────────────────
+  // ── Browser ──
   if (path === '/ws') {
-    browserSockets.add(ws);
-    console.log(`[relay] Browser connected (total: ${browserSockets.size})`);
+    const sid = crypto.randomUUID();
+    browsers.set(sid, ws);
+    console.log(`[relay] Browser ${sid.slice(0,8)} connected (total: ${browsers.size})`);
 
-    ws.on('message', (data) => {
-      // Forward browser message to the tunnel (Mac mini gateway)
+    // Tell tunnel a new browser connected
+    if (tunnelSocket && tunnelSocket.readyState === WebSocket.OPEN) {
+      tunnelSocket.send(JSON.stringify({ type: 'browser_open', sid }));
+    }
+
+    ws.on('message', (raw) => {
       if (tunnelSocket && tunnelSocket.readyState === WebSocket.OPEN) {
-        tunnelSocket.send(data.toString());
+        tunnelSocket.send(JSON.stringify({ sid, data: raw.toString() }));
       } else {
-        // No tunnel — send error back
         ws.send(JSON.stringify({
-          error: 'Gateway tunnel not connected. The Mac mini may be offline.',
+          error: 'Gateway tunnel not connected. Mac mini may be offline.',
         }));
       }
     });
 
     ws.on('close', () => {
-      browserSockets.delete(ws);
-      console.log(`[relay] Browser disconnected (total: ${browserSockets.size})`);
+      browsers.delete(sid);
+      console.log(`[relay] Browser ${sid.slice(0,8)} disconnected (total: ${browsers.size})`);
+      // Tell tunnel browser disconnected
+      if (tunnelSocket && tunnelSocket.readyState === WebSocket.OPEN) {
+        tunnelSocket.send(JSON.stringify({ type: 'browser_close', sid }));
+      }
     });
-
-    ws.on('error', (err) => {
-      console.error('[relay] Browser error:', err.message);
-      browserSockets.delete(ws);
-    });
-
     return;
   }
 
-  // Unknown path
   ws.close(4004, 'Unknown path');
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
-
 server.listen(PORT, () => {
-  console.log(`[relay] Corgi Relay listening on port ${PORT}`);
-  console.log(`[relay] Tunnel endpoint: /tunnel?token=<secret>`);
-  console.log(`[relay] Browser endpoint: /ws`);
+  console.log(`[relay] Corgi Relay v2 on port ${PORT}`);
 });

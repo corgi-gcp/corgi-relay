@@ -233,10 +233,20 @@ wss.on('connection', (ws, req) => {
       tunnels.delete(tunnelId);
     });
 
+    // Keepalive with stale detection
+    let alive = true;
+    ws.on('pong', () => { alive = true; });
     const ping = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.ping();
-      else clearInterval(ping);
-    }, 25000);
+      if (ws.readyState !== WebSocket.OPEN) { clearInterval(ping); return; }
+      if (!alive) {
+        console.log(`[relay] Tunnel '${tunnelId}' missed pong — terminating`);
+        ws.terminate();
+        clearInterval(ping);
+        return;
+      }
+      alive = false;
+      ws.ping();
+    }, 20000);
     return;
   }
 

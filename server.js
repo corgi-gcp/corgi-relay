@@ -35,14 +35,95 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3001;
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'corgi-tunnel-2026';
+const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || '';
+const RAILWAY_API = 'https://backboard.railway.com/graphql/v2';
+
+// Known project IDs to query
+const PROJECT_IDS = (process.env.RAILWAY_PROJECT_IDS || '').split(',').filter(Boolean);
 
 // ── State ──
 const tunnels = new Map();      // tunnelId → { ws, tokens: Set<string> }
 const tokenToTunnel = new Map(); // gatewayToken → tunnelId
 const browsers = new Map();      // sid → { ws, tunnelId: string|null, queue: string[] }
 
-// ── HTTP health endpoint ──
-const server = http.createServer((req, res) => {
+// ── Fetch Railway projects ──
+let appsCache = { data: null, ts: 0 };
+const APPS_CACHE_TTL = 60_000; // 1 minute
+
+async function fetchRailwayApps() {
+  if (!RAILWAY_TOKEN || PROJECT_IDS.length === 0) return null;
+  if (appsCache.data && Date.now() - appsCache.ts < APPS_CACHE_TTL) return appsCache.data;
+
+  const projects = [];
+  for (const pid of PROJECT_IDS) {
+    try {
+      const resp = await fetch(RAILWAY_API, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${RAILWAY_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: `{ project(id: "${pid}") { id name services { edges { node { name serviceInstances { edges { node { domains { serviceDomains { domain } } latestDeployment { status } } } } } } } } }`,
+        }),
+      });
+      const json = await resp.json();
+      const proj = json?.data?.project;
+      if (!proj) continue;
+
+      const services = [];
+      for (const s of proj.services.edges) {
+        const svc = s.node;
+        const instances = [];
+        for (const si of svc.serviceInstances.edges) {
+          const inst = si.node;
+          const status = inst.latestDeployment?.status || 'unknown';
+          for (const sd of inst.domains.serviceDomains) {
+            // Derive environment from domain
+            let env = 'production';
+            if (sd.domain.includes('-staging')) env = 'staging';
+            else if (sd.domain.includes('-dev') || sd.domain.includes('feature')) env = 'dev';
+            instances.push({ environment: env, domain: sd.domain, status });
+          }
+        }
+        if (instances.length > 0) {
+          services.push({ name: svc.name, instances });
+        }
+      }
+      projects.push({ name: proj.name, id: proj.id, services });
+    } catch (e) {
+      console.error(`[relay] Failed to fetch project ${pid}:`, e.message);
+    }
+  }
+
+  appsCache = { data: { projects }, ts: Date.now() };
+  return appsCache.data;
+}
+
+// ── CORS headers for dashboard ──
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+// ── HTTP endpoints ──
+const server = http.createServer(async (req, res) => {
+  setCors(res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (req.url === '/api/apps') {
+    const data = await fetchRailwayApps();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data || { projects: [] }));
+    return;
+  }
+
   if (req.url === '/health') {
     const tunnelStatus = {};
     for (const [id, t] of tunnels) {

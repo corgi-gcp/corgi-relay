@@ -1,25 +1,40 @@
 /**
- * Tunnel Client v2 — maintains a SEPARATE gateway WS per browser session.
+ * Tunnel Client v3 — Multi-tunnel aware
  *
- * Relay sends envelopes: { sid, data } or { type: "browser_open/close", sid }
- * For each browser sid, we open a dedicated gateway connection.
- * Gateway responses are wrapped back: { sid, data } → relay → browser
+ * Each Mac mini runs one of these. It connects to the shared relay with a
+ * unique TUNNEL_ID and registers the GATEWAY_TOKEN(s) it serves.
+ * The relay uses these tokens to route browser sessions to the right tunnel.
+ *
+ * Env vars:
+ *   RELAY_URL       — wss://relay-production-724a.up.railway.app
+ *   GATEWAY_URL     — ws://127.0.0.3:19789  (local gateway)
+ *   GATEWAY_TOKEN   — the auth token for this gateway (sent to relay for routing)
+ *   TUNNEL_SECRET   — shared secret to authenticate with relay
+ *   TUNNEL_ID       — unique identifier for this tunnel (e.g., "josh", "ta", "cr")
+ *   DASHBOARD_ORIGIN — Origin header for gateway connections (default: production dashboard)
  */
 
 'use strict';
 
+const WebSocket = require('ws');
+
 const RELAY_URL = process.env.RELAY_URL || '';
 const GATEWAY_URL = process.env.GATEWAY_URL || 'ws://127.0.0.3:19789';
+const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN || '';
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'corgi-tunnel-2026';
+const TUNNEL_ID = process.env.TUNNEL_ID || 'default';
+const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || 'https://dashboard-production-3553.up.railway.app';
 
 if (!RELAY_URL) {
   console.error('[tunnel] RELAY_URL is required');
   process.exit(1);
 }
 
-const fullRelayUrl = RELAY_URL.includes('?')
-  ? RELAY_URL
-  : `${RELAY_URL}/tunnel?token=${TUNNEL_SECRET}`;
+if (!GATEWAY_TOKEN) {
+  console.warn('[tunnel] WARNING: GATEWAY_TOKEN not set — relay won\'t route browsers to this tunnel');
+}
+
+const fullRelayUrl = `${RELAY_URL.replace(/\/+$/, '')}/tunnel?token=${encodeURIComponent(TUNNEL_SECRET)}&id=${encodeURIComponent(TUNNEL_ID)}`;
 
 let relayWs = null;
 const gateways = new Map(); // sid → { ws, ready, queue }
@@ -30,35 +45,35 @@ function openGateway(sid) {
   const entry = { ws: null, ready: false, queue: [] };
   gateways.set(sid, entry);
 
-  console.log(`[tunnel] Opening gateway for browser ${sid.slice(0,8)}`);
-  const ws = new WebSocket(GATEWAY_URL);
+  console.log(`[tunnel:${TUNNEL_ID}] Opening gateway for browser ${sid.slice(0, 8)}`);
+  const ws = new WebSocket(GATEWAY_URL, {
+    headers: { Origin: DASHBOARD_ORIGIN },
+  });
   entry.ws = ws;
 
-  ws.addEventListener('open', () => {
-    console.log(`[tunnel] Gateway open for ${sid.slice(0,8)}`);
+  ws.on('open', () => {
+    console.log(`[tunnel:${TUNNEL_ID}] Gateway open for ${sid.slice(0, 8)}`);
     entry.ready = true;
-    // Flush queued messages
     for (const msg of entry.queue) {
       ws.send(msg);
     }
     entry.queue = [];
   });
 
-  ws.addEventListener('message', (event) => {
-    const data = typeof event.data === 'string' ? event.data : event.data.toString();
-    // Send back to relay with sid envelope
+  ws.on('message', (data) => {
+    const str = typeof data === 'string' ? data : data.toString();
     if (relayWs && relayWs.readyState === WebSocket.OPEN) {
-      relayWs.send(JSON.stringify({ sid, data }));
+      relayWs.send(JSON.stringify({ sid, data: str }));
     }
   });
 
-  ws.addEventListener('close', () => {
-    console.log(`[tunnel] Gateway closed for ${sid.slice(0,8)}`);
+  ws.on('close', () => {
+    console.log(`[tunnel:${TUNNEL_ID}] Gateway closed for ${sid.slice(0, 8)}`);
     gateways.delete(sid);
   });
 
-  ws.addEventListener('error', (e) => {
-    console.error(`[tunnel] Gateway error for ${sid.slice(0,8)}:`, e.message || 'failed');
+  ws.on('error', (e) => {
+    console.error(`[tunnel:${TUNNEL_ID}] Gateway error for ${sid.slice(0, 8)}:`, e.message || 'failed');
   });
 }
 
@@ -67,7 +82,7 @@ function closeGateway(sid) {
   if (entry) {
     entry.ws?.close();
     gateways.delete(sid);
-    console.log(`[tunnel] Closed gateway for ${sid.slice(0,8)}`);
+    console.log(`[tunnel:${TUNNEL_ID}] Closed gateway for ${sid.slice(0, 8)}`);
   }
 }
 
@@ -84,20 +99,31 @@ function forwardToGateway(sid, data) {
   }
 }
 
+function registerTokens() {
+  if (!relayWs || relayWs.readyState !== WebSocket.OPEN) return;
+  if (!GATEWAY_TOKEN) return;
+
+  const tokens = GATEWAY_TOKEN.split(',').map((t) => t.trim()).filter(Boolean);
+  relayWs.send(JSON.stringify({ type: 'register_tokens', tokens }));
+  console.log(`[tunnel:${TUNNEL_ID}] Registered ${tokens.length} token(s) with relay`);
+}
+
 function connectRelay() {
   if (relayWs && relayWs.readyState === WebSocket.OPEN) return;
 
-  console.log('[tunnel] Connecting to relay...');
+  console.log(`[tunnel:${TUNNEL_ID}] Connecting to relay...`);
   relayWs = new WebSocket(fullRelayUrl);
 
-  relayWs.addEventListener('open', () => {
-    console.log('[tunnel] ✓ Connected to relay');
+  relayWs.on('open', () => {
+    console.log(`[tunnel:${TUNNEL_ID}] ✓ Connected to relay`);
+    // Register our gateway token(s) so the relay can route browsers to us
+    registerTokens();
   });
 
-  relayWs.addEventListener('message', (event) => {
-    const raw = typeof event.data === 'string' ? event.data : event.data.toString();
+  relayWs.on('message', (raw) => {
+    const str = typeof raw === 'string' ? raw : raw.toString();
     try {
-      const envelope = JSON.parse(raw);
+      const envelope = JSON.parse(str);
 
       if (envelope.type === 'browser_open') {
         openGateway(envelope.sid);
@@ -112,31 +138,28 @@ function connectRelay() {
         return;
       }
     } catch (e) {
-      console.error('[tunnel] Parse error:', e.message);
+      console.error(`[tunnel:${TUNNEL_ID}] Parse error:`, e.message);
     }
   });
 
-  relayWs.addEventListener('close', (event) => {
-    console.log(`[tunnel] Relay disconnected (${event.code}). Reconnecting in 3s...`);
+  relayWs.on('close', (code) => {
+    console.log(`[tunnel:${TUNNEL_ID}] Relay disconnected (${code}). Reconnecting in 3s...`);
     relayWs = null;
-    // Close all gateway connections
-    for (const [sid, entry] of gateways) {
-      entry.ws?.close();
-    }
+    for (const [, entry] of gateways) entry.ws?.close();
     gateways.clear();
     setTimeout(connectRelay, 3000);
   });
 
-  relayWs.addEventListener('error', (e) => {
-    console.error('[tunnel] Relay error:', e.message || 'failed');
+  relayWs.on('error', (e) => {
+    console.error(`[tunnel:${TUNNEL_ID}] Relay error:`, e.message || 'failed');
   });
 }
 
 connectRelay();
-setInterval(() => {}, 30000);
+setInterval(() => {}, 30000); // Keep process alive
 
 process.on('SIGTERM', () => {
-  console.log('[tunnel] Shutting down...');
+  console.log(`[tunnel:${TUNNEL_ID}] Shutting down...`);
   relayWs?.close();
   for (const [, entry] of gateways) entry.ws?.close();
   process.exit(0);

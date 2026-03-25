@@ -259,20 +259,12 @@ wss.on('connection', (ws, req) => {
       tunnels.delete(tunnelId);
     });
 
-    // Keepalive with stale detection
-    let alive = true;
-    ws.on('pong', () => { alive = true; });
+    // Keepalive: just ping to keep Railway proxy happy, no termination
+    // (tunnel client handles its own reconnection via data-level heartbeats)
     const ping = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) { clearInterval(ping); return; }
-      if (!alive) {
-        console.log(`[relay] Tunnel '${tunnelId}' missed pong — terminating`);
-        ws.terminate();
-        clearInterval(ping);
-        return;
-      }
-      alive = false;
       ws.ping();
-    }, 20000);
+    }, 25000);
     return;
   }
 

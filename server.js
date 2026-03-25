@@ -215,16 +215,17 @@ wss.on('connection', (ws, req) => {
             tokenToTunnel.set(t, tunnelId);
           }
           console.log(`[relay] Tunnel '${tunnelId}' registered ${newTokens.length} token(s)`);
-          // Re-notify tunnel about any browsers already connected for these tokens
-          let renotified = 0;
+          // Force-close any browsers that were connected to a previous tunnel instance
+          // They need to reconnect fresh (gateway requires new challenge-response handshake)
+          let bounced = 0;
           for (const [sid, browser] of browsers) {
             if (newTokens.includes(browser.token) && browser.ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'browser_open', sid }));
-              renotified++;
+              browser.ws.close(4005, 'Tunnel reconnected — please refresh');
+              bounced++;
             }
           }
-          if (renotified > 0) {
-            console.log(`[relay] Re-notified tunnel '${tunnelId}' about ${renotified} existing browser(s)`);
+          if (bounced > 0) {
+            console.log(`[relay] Bounced ${bounced} stale browser(s) after tunnel '${tunnelId}' reconnect`);
           }
           return;
         }

@@ -215,6 +215,26 @@ wss.on('connection', (ws, req) => {
             tokenToTunnel.set(t, tunnelId);
           }
           console.log(`[relay] Tunnel '${tunnelId}' registered ${newTokens.length} token(s)`);
+          // Re-notify tunnel about any browsers already connected for these tokens
+          let renotified = 0;
+          for (const [sid, browser] of browsers) {
+            if (newTokens.includes(browser.token) && browser.ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'browser_open', sid }));
+              renotified++;
+            }
+          }
+          if (renotified > 0) {
+            console.log(`[relay] Re-notified tunnel '${tunnelId}' about ${renotified} existing browser(s)`);
+          }
+          return;
+        }
+
+        // Gateway closed notification from tunnel
+        if (envelope.type === 'gateway_closed') {
+          const browser = browsers.get(envelope.sid);
+          if (browser && browser.ws.readyState === WebSocket.OPEN) {
+            browser.ws.close(4003, 'Gateway closed');
+          }
           return;
         }
 
@@ -293,7 +313,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    const browserEntry = { ws, tunnelId: targetTunnelId };
+    const browserEntry = { ws, tunnelId: targetTunnelId, token: browserToken };
     browsers.set(sid, browserEntry);
     console.log(`[relay] Browser ${sid.slice(0, 8)} connected (total: ${browsers.size})`);
 

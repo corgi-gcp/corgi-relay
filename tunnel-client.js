@@ -17,6 +17,8 @@
 'use strict';
 
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const RELAY_URL = process.env.RELAY_URL || '';
 const GATEWAY_URL = process.env.GATEWAY_URL || 'ws://127.0.0.3:19789';
@@ -24,6 +26,77 @@ const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN || '';
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'corgi-tunnel-2026';
 const TUNNEL_ID = process.env.TUNNEL_ID || 'default';
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || 'https://dashboard-production-3553.up.railway.app';
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '/Users/corgi12/.eragon-joshua_augustine/joshua_augustine_workspace';
+
+// ── MIME type map ──
+const MIME_TYPES = {
+  '.pdf':  'application/pdf',
+  '.txt':  'text/plain',
+  '.md':   'text/markdown',
+  '.json': 'application/json',
+  '.csv':  'text/csv',
+  '.js':   'application/javascript',
+  '.ts':   'application/typescript',
+  '.py':   'text/x-python',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg':  'image/svg+xml',
+  '.zip':  'application/zip',
+  '.html': 'text/html',
+  '.css':  'text/css',
+};
+
+// ── Handle file_request from relay ──
+async function handleFileRequest(requestId, filePath) {
+  function sendResponse(payload) {
+    if (relayWs && relayWs.readyState === WebSocket.OPEN) {
+      relayWs.send(JSON.stringify(payload));
+    }
+  }
+
+  try {
+    // Resolve relative to workspace
+    const resolved = path.resolve(WORKSPACE_DIR, filePath);
+
+    // Validate path stays within workspace
+    if (!resolved.startsWith(path.resolve(WORKSPACE_DIR) + path.sep) &&
+        resolved !== path.resolve(WORKSPACE_DIR)) {
+      sendResponse({ type: 'file_response', requestId, status: 'error', error: 'Path outside workspace' });
+      return;
+    }
+
+    // Check existence + size
+    let stat;
+    try {
+      stat = fs.statSync(resolved);
+    } catch {
+      sendResponse({ type: 'file_response', requestId, status: 'error', error: 'File not found' });
+      return;
+    }
+
+    if (!stat.isFile()) {
+      sendResponse({ type: 'file_response', requestId, status: 'error', error: 'Not a file' });
+      return;
+    }
+
+    const MAX_SIZE = 50 * 1024 * 1024; // 50 MB
+    if (stat.size > MAX_SIZE) {
+      sendResponse({ type: 'file_response', requestId, status: 'error', error: 'File exceeds 50 MB limit' });
+      return;
+    }
+
+    const data = fs.readFileSync(resolved).toString('base64');
+    const ext = path.extname(resolved).toLowerCase();
+    const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
+    const fileName = path.basename(resolved);
+
+    sendResponse({ type: 'file_response', requestId, status: 'ok', data, mimeType, fileName });
+    console.log(`[tunnel:${TUNNEL_ID}] Served file '${fileName}' (${stat.size} bytes)`);
+  } catch (e) {
+    sendResponse({ type: 'file_response', requestId, status: 'error', error: e.message || 'Unknown error' });
+  }
+}
 
 if (!RELAY_URL) {
   console.error('[tunnel] RELAY_URL is required');
@@ -131,6 +204,10 @@ function connectRelay() {
       }
       if (envelope.type === 'browser_close') {
         closeGateway(envelope.sid);
+        return;
+      }
+      if (envelope.type === 'file_request') {
+        handleFileRequest(envelope.requestId, envelope.filePath);
         return;
       }
       if (envelope.sid && envelope.data) {

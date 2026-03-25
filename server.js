@@ -43,6 +43,17 @@ const PROJECT_IDS = (process.env.RAILWAY_PROJECT_IDS || '').split(',').filter(Bo
 const tunnels = new Map();      // tunnelId → { ws, tokens: Set<string> }
 const tokenToTunnel = new Map(); // gatewayToken → tunnelId
 const browsers = new Map();      // sid → { ws, tunnelId: string|null }
+const fileRequests = new Map();  // requestId → { status, ts, data?, mimeType?, fileName?, error? }
+
+// ── Cleanup expired file requests every 60s ──
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, req] of fileRequests) {
+    if (now - req.ts > 30_000) {
+      fileRequests.delete(id);
+    }
+  }
+}, 60_000);
 
 // ── Fetch Railway projects ──
 let appsCache = { data: null, ts: 0 };
@@ -100,8 +111,24 @@ async function fetchRailwayApps() {
 // ── CORS headers ──
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+// ── Parse JSON request body ──
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+      } catch (e) {
+        reject(new Error('Invalid JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
 }
 
 // ── HTTP endpoints ──
@@ -112,6 +139,87 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204);
     res.end();
     return;
+  }
+
+  // ── POST /api/files/request ──
+  if (req.method === 'POST' && req.url === '/api/files/request') {
+    let body;
+    try {
+      body = await readBody(req);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      return;
+    }
+
+    const { token, filePath } = body || {};
+    if (!token || !filePath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing token or filePath' }));
+      return;
+    }
+
+    // Path traversal check
+    if (filePath.includes('..')) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path traversal not allowed' }));
+      return;
+    }
+
+    // Validate token → tunnel
+    const tunnelId = tokenToTunnel.get(token);
+    const tunnel = tunnelId ? tunnels.get(tunnelId) : null;
+    if (!tunnel || tunnel.ws.readyState !== WebSocket.OPEN) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No tunnel found for this token' }));
+      return;
+    }
+
+    const requestId = crypto.randomUUID();
+    fileRequests.set(requestId, { status: 'pending', ts: Date.now() });
+
+    tunnel.ws.send(JSON.stringify({ type: 'file_request', requestId, filePath }));
+
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ requestId }));
+    return;
+  }
+
+  // ── GET /api/files/download/:requestId ──
+  const downloadMatch = req.method === 'GET' && req.url.match(/^\/api\/files\/download\/([^/?]+)$/);
+  if (downloadMatch) {
+    const requestId = downloadMatch[1];
+    const entry = fileRequests.get(requestId);
+
+    if (!entry || Date.now() - entry.ts > 30_000) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Request not found or expired' }));
+      return;
+    }
+
+    if (entry.status === 'pending') {
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'pending' }));
+      return;
+    }
+
+    if (entry.status === 'error') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: entry.error || 'File error' }));
+      return;
+    }
+
+    if (entry.status === 'ready') {
+      fileRequests.delete(requestId);
+      const buf = Buffer.from(entry.data, 'base64');
+      res.writeHead(200, {
+        'Content-Type': entry.mimeType || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${entry.fileName || 'file'}"`,
+        'Content-Length': buf.length,
+      });
+      res.end(buf);
+      return;
+    }
   }
 
   if (req.url === '/api/apps') {
@@ -226,6 +334,20 @@ wss.on('connection', (ws, req) => {
           }
           if (bounced > 0) {
             console.log(`[relay] Bounced ${bounced} stale browser(s) after tunnel '${tunnelId}' reconnect`);
+          }
+          return;
+        }
+
+        // File response from tunnel
+        if (envelope.type === 'file_response') {
+          const { requestId, status, data, mimeType, fileName, error } = envelope;
+          const entry = fileRequests.get(requestId);
+          if (entry) {
+            if (status === 'ok') {
+              fileRequests.set(requestId, { ...entry, status: 'ready', data, mimeType, fileName });
+            } else {
+              fileRequests.set(requestId, { ...entry, status: 'error', error: error || 'Unknown error' });
+            }
           }
           return;
         }

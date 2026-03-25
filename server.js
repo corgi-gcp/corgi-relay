@@ -201,6 +201,12 @@ wss.on('connection', (ws, req) => {
       try {
         const envelope = JSON.parse(raw.toString());
 
+        // Heartbeat — just ack and keep connection active
+        if (envelope.type === 'heartbeat') {
+          ws.send(JSON.stringify({ type: 'heartbeat_ack', ts: Date.now() }));
+          return;
+        }
+
         // Token registration
         if (envelope.type === 'register_tokens') {
           const newTokens = envelope.tokens || [];
